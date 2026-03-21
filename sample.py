@@ -242,7 +242,7 @@ def main(mode, args):
                     last_step_size=args.last_step_size,
                     num_steps=args.num_sampling_steps,
                 )
-                samples = sample_fn(z_cfg, model.forward_with_cfg, y=y_cfg, cfg_scale=args.cfg_scale)
+                samples = sample_fn(z_cfg, model.forward_with_cfg, y=y_cfg, cfg_scale=args.cfg_scale)[-1]
             else:
                 sample_fn = sampler.sample_ode(
                     sampling_method=args.sampling_method,
