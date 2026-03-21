@@ -43,6 +43,7 @@ except ImportError:
     print("Warning: wandb not available. Similarity matrices will not be logged to WandB.")
 
 
+
 #################################################################################
 #                       Block-wise Cosine Similarity                            #
 #################################################################################
