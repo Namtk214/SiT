@@ -227,33 +227,47 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, return_block_tokens=False):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        return_block_tokens: if True, return (output, block_tokens) where block_tokens is a list of [N, T, D] tensors
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
+
+        block_tokens = []
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
+            if return_block_tokens:
+                block_tokens.append(x.clone())
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
+
+        if return_block_tokens:
+            return x, block_tokens
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, return_block_tokens=False):
         """
-        Forward pass of SiT, but also batches the unconSiTional forward pass for classifier-free guidance.
+        Forward pass of SiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+
+        if return_block_tokens:
+            model_out, block_tokens = self.forward(combined, t, y, return_block_tokens=True)
+        else:
+            model_out = self.forward(combined, t, y, return_block_tokens=False)
+
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -262,7 +276,14 @@ class SiT(nn.Module):
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        output = torch.cat([eps, rest], dim=1)
+
+        if return_block_tokens:
+            # Extract conditional branch only (second half)
+            batch_size_half = len(block_tokens[0]) // 2
+            block_tokens_cond = [bt[batch_size_half:] for bt in block_tokens]
+            return output, block_tokens_cond
+        return output
 
 
 #################################################################################
