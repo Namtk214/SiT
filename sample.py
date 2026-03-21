@@ -7,6 +7,7 @@ Sample new images from a pre-trained SiT.
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+import torch.nn.functional as F
 from torchvision.utils import save_image
 from diffusers.models import AutoencoderKL
 from download import find_model
@@ -16,6 +17,104 @@ from transport import create_transport, Sampler
 import argparse
 import sys
 from time import time
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from typing import List
+
+
+#################################################################################
+#               Block-wise Cosine Similarity Functions                          #
+#################################################################################
+
+def compute_block_cosine_matrix(block_tokens: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Compute pairwise cosine similarity matrix between all blocks.
+
+    Args:
+        block_tokens: List of hidden tokens from each block.
+                     Each element has shape [B, N, D] where:
+                     - B: batch size
+                     - N: number of patches/tokens
+                     - D: hidden dimension
+
+    Returns:
+        sim_mat: Cosine similarity matrix of shape [L, L] where L is number of blocks.
+                 sim_mat[a, b] = average cosine similarity between block a and block b.
+    """
+    if not block_tokens:
+        return None
+
+    # Stack all block outputs: [L, B, N, D]
+    H = torch.stack(block_tokens, dim=0)
+    L, B, N, D = H.shape
+
+    # Normalize along the hidden dimension
+    H_norm = F.normalize(H, p=2, dim=-1)  # [L, B, N, D]
+
+    # Compute pairwise cosine similarity: [L, L, B, N]
+    sim = torch.einsum('ibnd,jbnd->ijbn', H_norm, H_norm)
+
+    # Average over batch and patches: [L, L]
+    sim_mat = sim.mean(dim=(-1, -2))
+
+    return sim_mat
+
+
+def visualize_similarity_matrices(all_sim_mats, timesteps, output_path, model_depth):
+    """Visualize block-wise cosine similarity matrices across timesteps."""
+    num_timesteps = len(timesteps)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+
+    for idx in range(min(6, num_timesteps)):
+        if idx >= len(all_sim_mats):
+            axes[idx].axis('off')
+            continue
+
+        sim_mat = all_sim_mats[idx]
+        sns.heatmap(
+            sim_mat, ax=axes[idx], cmap='RdYlBu_r', vmin=0.0, vmax=1.0, square=True,
+            cbar_kws={'label': 'Cosine Similarity'},
+            xticklabels=range(model_depth), yticklabels=range(model_depth)
+        )
+        axes[idx].set_title(f'Timestep {timesteps[idx]}', fontsize=14, fontweight='bold')
+        axes[idx].set_xlabel('Block Index', fontsize=12)
+        axes[idx].set_ylabel('Block Index', fontsize=12)
+
+    for idx in range(num_timesteps, 6):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved similarity matrix visualization to {output_path}")
+    plt.close()
+
+
+def visualize_spatial_heatmap(block_tokens, block_a, block_b, grid_size, output_path):
+    """Visualize spatial heatmap of cosine similarity for a pair of blocks."""
+    h_a = block_tokens[block_a]
+    h_b = block_tokens[block_b]
+
+    h_a_norm = F.normalize(h_a, p=2, dim=-1)
+    h_b_norm = F.normalize(h_b, p=2, dim=-1)
+
+    patch_sim = torch.sum(h_a_norm * h_b_norm, dim=-1)
+    patch_sim_avg = patch_sim.mean(dim=0)
+    patch_map = patch_sim_avg.reshape(grid_size, grid_size).cpu().numpy()
+
+    plt.figure(figsize=(8, 7))
+    sns.heatmap(patch_map, cmap='RdYlBu_r', vmin=0.0, vmax=1.0, square=True,
+                cbar_kws={'label': 'Cosine Similarity'})
+    plt.title(f'Spatial Similarity: Block {block_a} vs Block {block_b}',
+              fontsize=14, fontweight='bold')
+    plt.xlabel('Patch X', fontsize=12)
+    plt.ylabel('Patch Y', fontsize=12)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved spatial heatmap to {output_path}")
+    plt.close()
 
 
 def main(mode, args):
@@ -86,27 +185,179 @@ def main(mode, args):
 
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-    
-    # Create sampling noise:
     n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
-    y = torch.tensor(class_labels, device=device)
 
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+    # Block analysis mode
+    if hasattr(args, 'analyze_blocks') and args.analyze_blocks:
+        print(f"\n{'='*60}")
+        print(f"BLOCK ANALYSIS MODE ENABLED")
 
-    # Sample images:
-    start_time = time()
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
-    print(f"Sampling took {time() - start_time:.2f} seconds.")
+        # Parse noise levels
+        noise_levels = [float(x) for x in args.noise_levels.split(',')]
+        print(f"Noise levels: {noise_levels}")
 
-    # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+        model_depth = len(model.blocks)
+        grid_size = int(model.x_embedder.num_patches ** 0.5)
+        print(f"Model depth: {model_depth} blocks")
+        print(f"Track at mid-point of sampling")
+        print(f"{'='*60}\n")
+
+        # Create output directory
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        results_by_noise = {}
+
+        # Loop through each noise level
+        for noise_scale in noise_levels:
+            print(f"\n{'='*60}")
+            print(f"Processing noise level: {noise_scale:.2f}")
+            print(f"{'='*60}")
+
+            # Create noise with specific scale
+            z = torch.randn(n, 4, latent_size, latent_size, device=device) * noise_scale
+            y = torch.tensor(class_labels, device=device)
+
+            # Setup CFG
+            z_cfg = torch.cat([z, z], 0)
+            y_null = torch.tensor([1000] * n, device=device)
+            y_cfg = torch.cat([y, y_null], 0)
+
+            # Track similarity at mid-point
+            mid_step = args.num_sampling_steps // 2
+            similarity_matrix = None
+
+            if mode == "SDE":
+                # SDE sampling
+                t0, t1 = transport.check_interval(
+                    transport.train_eps, transport.sample_eps,
+                    diffusion_form=args.diffusion_form, sde=True,
+                    eval=True, reverse=False, last_step_size=args.last_step_size,
+                )
+                t = torch.linspace(t0, t1, args.num_sampling_steps).to(device)
+                dt = t[1] - t[0]
+
+                x = z_cfg
+                start_time = time()
+
+                for step_idx, t_cur in enumerate(t[:-1]):
+                    t_batch = torch.ones(x.size(0), device=device) * t_cur
+
+                    # Track at mid-point
+                    if step_idx == mid_step:
+                        model_output, block_tokens = model.forward_with_cfg(
+                            x, t_batch, y_cfg, args.cfg_scale, return_block_tokens=True
+                        )
+                        similarity_matrix = compute_block_cosine_matrix(block_tokens)
+                        print(f"Collected similarity at step {step_idx} (t={t_cur.item():.3f})")
+                    else:
+                        model_output = model.forward_with_cfg(x, t_batch, y_cfg, args.cfg_scale)
+
+                    # SDE update
+                    drift = model_output
+                    score = transport.get_score_from_velocity()(x, t_batch, model_output)
+                    diffusion_val = transport.path_sampler.compute_diffusion(
+                        x, t_batch, form=args.diffusion_form, norm=args.diffusion_norm
+                    )
+                    drift = drift + diffusion_val * score
+
+                    w_cur = torch.randn_like(x)
+                    dw = w_cur * torch.sqrt(dt)
+                    mean_x = x + drift * dt
+                    x = mean_x + torch.sqrt(2 * diffusion_val) * dw
+
+                # Last step
+                t_last = torch.ones(x.size(0), device=device) * t1
+                pred_last = model.forward_with_cfg(x, t_last, y_cfg, args.cfg_scale)
+                x = x + pred_last * args.last_step_size
+                samples = x
+                print(f"Sampling took {time() - start_time:.2f} seconds.")
+            else:
+                # ODE mode
+                start_time = time()
+                samples = sample_fn(z_cfg, model.forward_with_cfg, y=y_cfg, cfg_scale=args.cfg_scale)[-1]
+                print(f"Sampling took {time() - start_time:.2f} seconds.")
+
+            # Extract conditional samples
+            samples, _ = samples.chunk(2, dim=0)
+            samples = vae.decode(samples / 0.18215).sample
+
+            # Save results for this noise level
+            noise_dir = output_dir / f"noise_{noise_scale:.2f}"
+            noise_dir.mkdir(exist_ok=True)
+
+            # Save images
+            save_image(samples, noise_dir / "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+            for i, img in enumerate(samples):
+                save_image(img, noise_dir / f"sample_{i:02d}.png", normalize=True, value_range=(-1, 1))
+
+            # Save similarity matrix
+            if similarity_matrix is not None:
+                sim_mat_np = similarity_matrix.cpu().numpy()
+                results_by_noise[noise_scale] = sim_mat_np
+                np.save(noise_dir / "similarity_matrix.npy", sim_mat_np)
+
+                # Plot individual heatmap
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(sim_mat_np, annot=False, cmap='viridis', vmin=0, vmax=1, square=True)
+                plt.title(f'Block Similarity - Noise={noise_scale:.2f}')
+                plt.xlabel('Block Index')
+                plt.ylabel('Block Index')
+                plt.tight_layout()
+                plt.savefig(noise_dir / "similarity_matrix.png", dpi=150)
+                plt.close()
+
+        # Create comparison visualization
+        if len(results_by_noise) > 1:
+            print(f"\n{'='*60}")
+            print("Creating noise level comparison...")
+            print(f"{'='*60}")
+
+            n_levels = len(noise_levels)
+            ncols = min(5, n_levels)
+            nrows = (n_levels + ncols - 1) // ncols
+
+            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3.5, nrows*3))
+            if n_levels == 1:
+                axes = [axes]
+            else:
+                axes = axes.flatten()
+
+            for idx, noise_level in enumerate(sorted(results_by_noise.keys())):
+                sim_mat = results_by_noise[noise_level]
+                sns.heatmap(sim_mat, ax=axes[idx], annot=False, cmap='viridis',
+                           vmin=0, vmax=1, square=True, cbar=True)
+                axes[idx].set_title(f'Noise={noise_level:.2f}')
+                axes[idx].set_xlabel('Block')
+                axes[idx].set_ylabel('Block')
+
+            for idx in range(n_levels, len(axes)):
+                axes[idx].axis('off')
+
+            plt.suptitle('Block-wise Cosine Similarity Across Noise Levels')
+            plt.tight_layout()
+            plt.savefig(output_dir / "noise_comparison.png", dpi=150)
+            plt.close()
+
+        print(f"\n{'='*60}")
+        print(f"Results saved to: {output_dir}")
+        print(f"{'='*60}\n")
+
+    else:
+        # Standard sampling (no block analysis)
+        z = torch.randn(n, 4, latent_size, latent_size, device=device)
+        y = torch.tensor(class_labels, device=device)
+        z = torch.cat([z, z], 0)
+        y_null = torch.tensor([1000] * n, device=device)
+        y = torch.cat([y, y_null], 0)
+        model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+
+        start_time = time()
+        samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
+        samples, _ = samples.chunk(2, dim=0)
+        samples = vae.decode(samples / 0.18215).sample
+        print(f"Sampling took {time() - start_time:.2f} seconds.")
+        save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
 
 
 if __name__ == "__main__":
@@ -130,6 +381,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
+    parser.add_argument("--analyze-blocks", action="store_true",
+                        help="Enable block-wise cosine similarity analysis")
+    parser.add_argument("--noise-levels", type=str, default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
+                        help="Comma-separated noise levels for analysis (default: 0.1,0.2,...,1.0)")
+    parser.add_argument("--output-dir", type=str, default="./similarity_results",
+                        help="Output directory for similarity analysis results")
 
 
     parse_transport_args(parser)
