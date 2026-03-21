@@ -138,7 +138,9 @@ def main(mode, args):
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
         learn_sigma = args.image_size == 256
     else:
-        learn_sigma = False
+        # For custom checkpoints, try to auto-detect learn_sigma from checkpoint
+        # Most 256x256 models use learn_sigma=True
+        learn_sigma = True if args.image_size == 256 else False
 
     # Load model:
     latent_size = args.image_size // 8
