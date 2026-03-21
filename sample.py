@@ -18,7 +18,8 @@ import argparse
 import sys
 from time import time
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
 import seaborn as sns
 from pathlib import Path
 from typing import List
