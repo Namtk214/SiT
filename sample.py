@@ -16,10 +16,17 @@ from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from transport import create_transport, Sampler
 import argparse
 import sys
+import os
 from time import time
 import numpy as np
+
+# Fix matplotlib backend issue in Jupyter/Colab
+if 'MPLBACKEND' in os.environ:
+    del os.environ['MPLBACKEND']
+
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')  # Set backend before importing pyplot
+import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 from typing import List
