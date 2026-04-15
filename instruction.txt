@@ -1,0 +1,1426 @@
+INSTRUCTION.TXT
+Experimental Protocol for Analyzing Common and Residual Representations in SiT
+Version: consolidated from the uploaded protocol, with full Task-by-Task instructions preserved and rewritten for implementation clarity
+================================================================================
+BASIC INFORMATION:
+- for dataset image: You should extract on ImageNet on bucket mounted in this server
+- This server is TPUv4-16, at first you should try to run on all workers or connect workers with each 
+other, make sure all worker run simultanously (If its warning TPU .... that mean y did not connect all TPU)
+- Use pre trained SiT (How to download model: SiT.py)
+- You should create 10 folder for each experiments result
+
+
+================================================================================
+0. OVERALL GOAL
+================================================================================
+
+This experimental protocol is designed to test two central hypotheses in SiT:
+
+H1. There exists a common representation shared across layers and timesteps.
+H2. That shared/common representation mainly encodes spatial structure, while the residual after subtracting the common part retains information specific to layer identity and/or timestep identity.
+
+To test these hypotheses, the protocol must:
+- extract activations A_{i,t}(x) at each layer i and timestep t;
+- also include A_patch(x), the feature after patchify / patch embedding before entering the model;
+- define A_common in multiple ways:
+  (a) mean-common
+  (b) subspace-common, in practice fixed-rank truncated-SVD common for the main protocol
+- define the residual as:
+    B_{i,t}(x) = A_{i,t}(x) - A_common(x)
+  or, for the subspace case:
+    B_{i,t}(x) = A_{i,t}(x) - Proj_{U_common}(A_{i,t}(x))
+
+Then evaluate the representations using:
+- basic statistics: min, max, mean, variance
+- visualization: PCA-RGB, t-SNE, UMAP
+- linear probes: semantic probe (if labels exist), layer-id probe, timestep-id probe
+- similarity metrics: token-mean cosine, flattened cosine, CKA
+- patch-wise cosine maps
+- spatial metrics: LDS, CDS, SRSS, RMSC
+- spatial controls / stress tests
+- wavelet decomposition
+
+The main experiments kept in the final protocol are:
+- Exp. 1: causal ablation
+- Exp. 2: multiple common definitions
+- Exp. 3: spatial stress test
+- Exp. 6: spatial metrics / spatial probe family
+- Exp. 7: layer-timestep map
+- Exp. 10: wavelet decomposition
+
+================================================================================
+1. GLOBAL DEFAULT SETTING
+================================================================================
+
+1.1 Backbone / model setting
+
+Use SiT-XL/2 as the default backbone for the main experiment.
+
+Fixed model setting:
+- Model size: SiT-XL/2
+- Number of transformer blocks: L = 28
+- Hidden dimension: D = 1152
+- Number of attention heads: 16
+- Patch size: 2
+- Main image resolution: 256 x 256
+
+Compact notation:
+SiT-XL/2 : (L, D, H_head) = (28, 1152, 16)
+
+All activation tensors should follow:
+A_{i,t}(x) in R^{P x 1152}, for i in {1,...,28}, t in T
+where P is the number of patch tokens in the latent grid.
+
+1.2 Timestep setting
+
+Use 10 representative timesteps.
+
+Let the full scheduler / trajectory length be T_total.
+Define:
+T = {t_1, ..., t_10}
+
+Uniform selection:
+t_k = floor( ((k-1)/9) * (T_total - 1) ),  for k = 1,...,10
+
+Rationale:
+- sparse enough to capture early / middle / late behavior
+- small enough to control storage/computation cost
+- large enough so timestep heatmaps remain meaningful
+
+For the first official run, use exactly the evenly spaced 10 timesteps above.
+
+1.3 Layer setting
+
+Preferred setting:
+- use all 28 layers
+
+If storage/computation becomes too heavy, a reduced exploratory setting may use 8-12 representative layers:
+- 2-3 early layers
+- 3-4 middle layers
+- 2-3 late layers
+
+However, because the central hypothesis explicitly concerns common structure across layers, the main protocol should use all 28 layers.
+
+1.4 Dataset size
+
+Pilot run:
+- 100 images
+- 10 timesteps
+- all layers
+- 1 checkpoint
+- 1 seed
+
+Main run:
+- 500 to 1000 images
+- 10 timesteps
+- all layers
+- 1 main checkpoint
+- 1 seed
+
+Recommended for the official main result:
+- main dataset: 500 images
+- control dataset: 100 images
+
+1.5 Seed
+
+Use exactly 1 main seed for the official protocol.
+Do not mix multiple seeds inside the core protocol.
+
+1.6 Storage / dtype
+
+Do not keep the entire activation bank on GPU.
+Write tensors to disk batch-by-batch or shard-by-shard.
+
+Recommended storage style:
+- activations/img_{id}/t_{t}/layer_{i}.pt
+or
+- shard_000.pt, shard_001.pt, ...
+
+Recommended dtypes:
+- bfloat16 or float16 for general tensor storage
+- float32 for PCA / SVD / CKA / wavelet computations
+
+1.7 Metadata
+
+Every saved tensor bank must include metadata with:
+- image id
+- timestep
+- layer
+- seed
+- checkpoint
+- dtype
+- common variant name
+
+================================================================================
+2. CORE TENSORS AND DEFINITIONS
+================================================================================
+
+2.1 Raw activation tensor
+
+For each image x, timestep t, and layer i:
+A_{i,t}(x) in R^{P x D}
+
+Also extract:
+A_patch(x)
+
+2.2 Per-token L2 normalization
+
+Before constructing common representations, normalize each patch token:
+
+A_tilde_{i,t}(x)_p = A_{i,t}(x)_p / ( ||A_{i,t}(x)_p||_2 + eps )
+
+Use:
+eps = 1e-6
+
+This normalization is mandatory in the main protocol.
+
+2.3 Mean-common
+
+For a fixed timestep t:
+A_common,mean^{(t)}(x) = (1/28) * sum_{i=1}^{28} A_tilde_{i,t}(x)
+
+Corresponding residual:
+B_mean_{i,t}(x) = A_tilde_{i,t}(x) - A_common,mean^{(t)}(x)
+
+This is the main/common definition used for the principal report.
+
+2.4 Fixed-rank truncated-SVD common
+
+For each image x, stack all normalized activations across all layers and timesteps:
+M(x) in R^{(28 * 10 * P) x 1152}
+
+Compute truncated SVD:
+M(x) approx U_K Sigma_K V_K^T
+
+Use fixed ranks:
+K in {16, 32, 64}
+
+Then define:
+A_common,tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) V_K V_K^T
+
+Residual:
+B_tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) - A_common,tsvd,K_{i,t}(x)
+
+Important:
+For the main protocol, DO NOT use adaptive-rank subspace-common.
+Use only:
+- mean-common
+- fixed-rank truncated-SVD common with K = 16, 32, 64
+
+================================================================================
+3. FULL EXECUTION ORDER
+================================================================================
+
+The required execution order is:
+
+1. Task 0: Extract activations and build common/residual
+2. Task 1: Basic statistics
+3. Task 2: Similarity heatmaps
+4. Task 3: Layer-timestep maps
+5. Task 4: Spatial structure metrics
+6. Task 5: Layer-id / timestep-id probes
+7. Task 6: Causal ablation
+8. Task 7: Patch-wise cosine maps
+9. Task 8: PCA / t-SNE / UMAP visualization
+10. Task 9: Spatial stress test
+11. Task 10 / Task 11 in the source numbering: Wavelet decomposition
+
+Rules:
+- Do not skip tasks.
+- Only move to the next task after the previous one passes its sanity checks.
+- Each task must produce all required artifacts / tables / figures before moving on.
+- If a task fails a sanity check, fix it before continuing.
+
+From Task 1 onward, every task must be run independently for all common variants:
+- mean-common
+- truncated-SVD common K = 16
+- truncated-SVD common K = 32
+- truncated-SVD common K = 64
+
+================================================================================
+4. TASK-BY-TASK INSTRUCTIONS
+================================================================================
+
+------------------------------------------------------------------------------
+TASK 0. EXTRACT ACTIVATIONS AND BUILD COMMON / RESIDUAL
+------------------------------------------------------------------------------
+
+Purpose
+-------
+This is the foundation task.
+If Task 0 is wrong, all subsequent tasks become unreliable.
+
+The goals are:
+- extract the correct activations from SiT-XL/2 at every required layer;
+- construct the two mandatory common families:
+  1. mean-common
+  2. fixed-rank truncated-SVD common with K in {16, 32, 64}
+- construct the corresponding residual tensors correctly;
+- save all tensors to disk with complete metadata so later tasks only need to load them.
+
+Required preparation
+--------------------
+- Backbone: SiT-XL/2
+- Number of blocks: exactly 28
+- Hidden dimension: exactly 1152
+- Checkpoint: the main checkpoint c*
+- Seed: the main seed s0
+- Main dataset: exactly 500 images
+- Control dataset: exactly 100 images
+- Timesteps: exactly the 10 selected timesteps
+  T = {t_1,...,t_10}
+
+Exact setting that must be used
+-------------------------------
+- Use all 28 layers:
+  i in {1,...,28}
+- Use all 10 timesteps:
+  t in T
+- Extract both:
+  - patch embedding output
+  - output after each transformer block
+- Before building common, L2-normalize each patch token:
+  A_tilde_{i,t}(x)_p = A_{i,t}(x)_p / (||A_{i,t}(x)_p||_2 + eps), eps = 1e-6
+- Mean-common must be:
+  A_common,mean^{(t)}(x) = (1/28) * sum_{i=1}^{28} A_tilde_{i,t}(x)
+- Mean residual must be:
+  B_mean_{i,t}(x) = A_tilde_{i,t}(x) - A_common,mean^{(t)}(x)
+- For truncated-SVD common:
+  M(x) in R^{(28*10*P) x 1152}, M(x) approx U_K Sigma_K V_K^T
+  with K in {16, 32, 64}
+- Truncated-SVD common must be:
+  A_common,tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) V_K V_K^T
+- Truncated-SVD residual must be:
+  B_tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) - A_common,tsvd,K_{i,t}(x)
+- Dtype:
+  - bfloat16 or float16 for stored tensors
+  - float32 for tensors used in PCA / SVD / CKA / wavelet
+
+Input
+-----
+There is no tensor input from earlier tasks.
+Direct inputs are:
+- image x
+- timestep t
+- SiT-XL/2 at checkpoint c*
+- seed s0
+
+Steps to execute in order
+-------------------------
+1. For each image x, run the model at every timestep t in T.
+2. Use forward hooks to extract:
+   A_patch(x), A_{1,t}(x), ..., A_{28,t}(x)
+3. Normalize all patch tokens to obtain A_tilde_{i,t}(x).
+4. Build mean-common:
+   A_common,mean^{(t)}(x)
+5. Build corresponding mean residual:
+   B_mean_{i,t}(x)
+6. For each image x, build the large matrix:
+   M(x) in R^{(28*10*P) x 1152}
+7. For each K in {16,32,64}, run truncated SVD to obtain V_K.
+8. Build:
+   A_common,tsvd,K_{i,t}(x)
+   B_tsvd,K_{i,t}(x)
+9. Save all tensors to disk with metadata.
+
+Core formulas
+-------------
+A_tilde_{i,t}(x)_p = A_{i,t}(x)_p / (||A_{i,t}(x)_p||_2 + eps)
+
+A_common,mean^{(t)}(x) = (1/28) * sum_{i=1}^{28} A_tilde_{i,t}(x)
+
+B_mean_{i,t}(x) = A_tilde_{i,t}(x) - A_common,mean^{(t)}(x)
+
+M(x) approx U_K Sigma_K V_K^T,   K in {16,32,64}
+
+A_common,tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) V_K V_K^T
+
+B_tsvd,K_{i,t}(x) = A_tilde_{i,t}(x) - A_common,tsvd,K_{i,t}(x)
+
+Required output artifact names
+------------------------------
+- task0_Apatch.pt
+- task0_Araw_shards/*.pt
+- task0_Atilde_shards/*.pt
+- task0_Acommon_mean_shards/*.pt
+- task0_Bres_mean_shards/*.pt
+- task0_Acommon_tsvd_K16_shards/*.pt
+- task0_Acommon_tsvd_K32_shards/*.pt
+- task0_Acommon_tsvd_K64_shards/*.pt
+- task0_Bres_tsvd_K16_shards/*.pt
+- task0_Bres_tsvd_K32_shards/*.pt
+- task0_Bres_tsvd_K64_shards/*.pt
+- task0_metadata.csv
+
+Exact figure / table to generate
+--------------------------------
+- Table T0: tensor shapes, number of images, number of timesteps, number of layers, dtype, and available common variants
+
+Split / averaging order
+-----------------------
+- No train/test split
+- No averaging except:
+  - mean across layers to build mean-common
+  - projection onto truncated-SVD subspace to build fixed-rank common
+
+Fail conditions / sanity checks
+-------------------------------
+- Tensor shape must be exactly:
+  A_{i,t}(x) in R^{P x 1152}
+- Every image must have all 28 layers
+- Every image must have all 10 timesteps
+- If one layer or one timestep is missing -> fail
+- If B_mean_{i,t}(x) is identically zero for all layers -> fail
+- If B_tsvd,K_{i,t}(x) is zero for many images and many K -> fail
+- If metadata does not match tensor files -> fail
+
+------------------------------------------------------------------------------
+TASK 1. BASIC STATISTICS
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Measure basic statistics of raw/common/residual to inspect:
+- representation scale
+- dispersion
+- stability
+- layer/timestep differentiation
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+- Use all 28 layers and all 10 timesteps
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+For every:
+x, i in {1,...,28}, t in T
+compute statistics for all valid tensors of each common family.
+Do not use an image subset, layer subset, or timestep subset.
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. Load all tensors from Task 0.
+2. For each tensor Z, normalize each token:
+   Z_tilde_p = Z_p / (||Z_p||_2 + eps), eps = 1e-6
+3. Compute:
+   min(Z), max(Z), mean(Z), var(Z)
+4. Save per-image, per-layer, per-timestep results for each common family.
+5. Aggregate summary by layer and by timestep.
+
+Core formulas
+-------------
+min(Z) = min_{p,d} Z_{p,d}
+max(Z) = max_{p,d} Z_{p,d}
+
+mean(Z) = (1 / (P*1152)) * sum_{p=1}^{P} sum_{d=1}^{1152} Z_tilde_{p,d}
+
+var(Z) = (1 / (P*1152)) * sum_{p=1}^{P} sum_{d=1}^{1152} ( Z_tilde_{p,d} - mean(Z) )^2
+
+Required output artifact names
+------------------------------
+- task1_mean_stats.csv
+- task1_mean_stats_by_layer.csv
+- task1_mean_stats_by_time.csv
+- task1_tsvd_K16_stats.csv
+- task1_tsvd_K32_stats.csv
+- task1_tsvd_K64_stats.csv
+
+Exact figure / table to generate
+--------------------------------
+- Table T1: statistics summary for mean-common
+- Table T2: statistics summary for truncated-SVD common with K = 16, 32, 64
+- Figure T1: line plot by layer
+- Figure T2: line plot by timestep
+
+Split / averaging order
+-----------------------
+- No split
+- Compute statistics per-image / per-layer / per-timestep first
+- Average over images first
+- For layer plots: then average across timesteps
+- For timestep plots: then average across layers
+- Never mix common families in the same average
+
+Fail conditions / sanity checks
+-------------------------------
+- If raw/common/residual statistics are exactly identical -> fail
+- If variance is NaN -> fail
+- If one layer or one timestep has missing results -> fail
+
+------------------------------------------------------------------------------
+TASK 2. SIMILARITY HEATMAPS
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Construct similarity heatmaps to inspect:
+- how similar raw activations are to each other
+- how close common is to raw
+- whether residual really removes the shared part
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+- Use all 28 layers and all 10 timesteps
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+For each common family, generate exactly three groups of heatmaps:
+1. layer x layer at each timestep
+2. timestep x timestep at each layer
+3. separate raw / common / residual heatmaps
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. For each image, compute token-mean cosine for the required tensor pairs.
+2. Compute flattened cosine for the required pairs.
+3. Compute CKA for the required pairs.
+4. Average each heatmap entry over all 500 images.
+5. Render final heatmaps for raw/common/residual, separately for mean-common and each K.
+
+Core formulas
+-------------
+Token-mean cosine:
+Cos_tokenmean(X,Y) = (1/P) * sum_{p=1}^{P} ( X_p^T Y_p / (||X_p||_2 ||Y_p||_2) )
+
+Flattened cosine:
+Cos_flat(X,Y) = vec(X)^T vec(Y) / ( ||vec(X)||_2 ||vec(Y)||_2 )
+
+For CKA:
+Use a standard linear CKA implementation consistently across all pairs.
+
+Required output artifact names
+------------------------------
+- task2_mean_tokenmean_heatmap.npy
+- task2_mean_flatcos_heatmap.npy
+- task2_mean_cka_heatmap.npy
+- task2_tsvd_K16_tokenmean_heatmap.npy
+- task2_tsvd_K32_tokenmean_heatmap.npy
+- task2_tsvd_K64_tokenmean_heatmap.npy
+- task2_figures.pdf
+
+Exact figure / table to generate
+--------------------------------
+- Figure T3: raw heatmap
+- Figure T4: mean-common heatmap
+- Figure T5: truncated-SVD common heatmap
+- Figure T6: residual heatmap
+- Table T3: average similarity summary
+
+Split / averaging order
+-----------------------
+- No split
+- Compute per-image heatmaps first
+- Average entrywise over images
+- Render only after averaging
+- Never mix mean-common and truncated-SVD common in the same report
+
+Fail conditions / sanity checks
+-------------------------------
+- Heatmaps must be symmetric
+- Diagonal entries must be the largest or near-largest
+- If residual heatmap is nearly identical to raw heatmap -> fail
+
+------------------------------------------------------------------------------
+TASK 3. LAYER-TIMESTEP MAP
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Build a 28 x 10 map for key metrics to determine:
+- where spatial signal is strong in layer-timestep space
+- where residual carries source-specific signal
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Build exactly three 28 x 10 maps for each common family:
+1. LDS on raw
+2. cosine-to-common on raw
+3. probe score on residual
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. For each (i,t,x), compute LDS on raw.
+2. For each (i,t,x), compute cosine-to-common.
+3. For each (i,t,x), compute probe score on residual.
+4. Average over images to obtain one scalar for each cell (i,t).
+5. Plot the heatmaps separately for mean-common and for each K.
+
+Core formulas
+-------------
+M_LDS[i,t] = (1/500) * sum_x LDS( A_{i,t}(x) )
+
+M_cos[i,t] = (1/500) * sum_x Cos_tokenmean( A_{i,t}(x), A_common(x) )
+
+Required output artifact names
+------------------------------
+- task3_mean_lds_map.npy
+- task3_mean_cos_map.npy
+- task3_mean_probe_map.npy
+- task3_tsvd_K16_lds_map.npy
+- task3_tsvd_K32_lds_map.npy
+- task3_tsvd_K64_lds_map.npy
+- task3_maps.pdf
+
+Exact figure / table to generate
+--------------------------------
+- Figure T7: mean-common maps
+- Figure T8: truncated-SVD maps
+
+Split / averaging order
+-----------------------
+- Compute per-image first
+- Average over images
+- Do not average across layer or timestep before plotting
+- Never mix common families
+
+Fail conditions / sanity checks
+-------------------------------
+- Heatmap shape must be exactly 28 x 10
+- If a heatmap is completely flat -> fail
+
+------------------------------------------------------------------------------
+TASK 4. SPATIAL STRUCTURE METRICS
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Measure spatial structure using LDS, CDS, SRSS (if masks are available), and RMSC.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+- Use all 28 layers and all 10 timesteps
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Hyperparameters:
+- similarity kernel: cosine similarity
+- spatial distance: Manhattan distance on the patch grid
+- LDS: r_near = r_far = H/2
+- CDS: delta in {1,...,H-1}
+- RMSC: L2-normalize tokens with eps = 1e-6
+- SRSS:
+  - if segmentation/semantic masks are available, use them
+  - otherwise SRSS may be omitted from the main table but document that it requires masks
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. For each tensor X, build the self-similarity matrix using cosine.
+2. Compute LDS.
+3. Compute CDS.
+4. Compute RMSC.
+5. If masks are available, compute SRSS.
+6. Save results per-image / per-layer / per-time.
+7. Average over all images.
+8. Report separately for mean-common and each K.
+
+Core formulas
+-------------
+Self-similarity:
+K_X(t,t') = <x_t, x_t'> / ( ||x_t||_2 ||x_t'||_2 )
+
+LDS:
+LDS(X) = E[ K_X(t,t') | d(t,t') < r_near ] - E[ K_X(t,t') | d(t,t') >= r_far ]
+
+Spatial correlogram:
+g_X(delta) = E[ K_X(t,t') | d(t,t') = delta ]
+
+Fit:
+g_X(delta) approx alpha + beta * delta
+
+CDS:
+CDS(X) = - beta_hat
+
+RMSC:
+x_hat_t = x_t / (||x_t||_2 + eps)
+x_bar = (1/T_tokens) * sum_t x_hat_t
+
+RMSC(X) = sqrt( (1/T_tokens) * sum_t ||x_hat_t - x_bar||_2^2 )
+
+SRSS:
+SRSS(X) = E[ cos(x_anchor, x_pos) - cos(x_anchor, x_neg) ]
+where anchor and pos are in the same semantic region and neg is outside the region.
+
+Required output artifact names
+------------------------------
+- task4_mean_lds.csv
+- task4_mean_cds.csv
+- task4_mean_rmsc.csv
+- task4_tsvd_K16_lds.csv
+- task4_tsvd_K32_lds.csv
+- task4_tsvd_K64_lds.csv
+- task4_summary.tex
+
+Exact figure / table to generate
+--------------------------------
+- Table T4: LDS / CDS / RMSC summary for mean-common
+- Table T5: LDS / CDS / RMSC summary for truncated-SVD common
+- Figure T9: layer-wise curves
+- Figure T10: timestep-wise curves
+
+Split / averaging order
+-----------------------
+- No split
+- Compute per-image first
+- Average over images
+- For layer plots: then average over timesteps
+- For timestep plots: then average over layers
+- Never mix common families
+
+Fail conditions / sanity checks
+-------------------------------
+- LDS / CDS / RMSC must not be NaN
+- If all metrics are nearly constant everywhere -> fail
+
+------------------------------------------------------------------------------
+TASK 5. LAYER-ID / TIMESTEP-ID PROBES
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Directly measure source-specific information in raw/common/residual.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+- Use all 28 layers and all 10 timesteps
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Descriptor:
+- use mean pooling over tokens only
+- do not use any other pooling type
+
+Labels:
+- y_layer = i
+- y_time = t
+
+Input tensor names
+------------------
+- z_raw[i,t,x]
+- z_meancommon[i,t,x]
+- z_resmean[i,t,x]
+- z_tsvdK16[i,t,x]
+- z_tsvdK32[i,t,x]
+- z_tsvdK64[i,t,x]
+- z_restsK16[i,t,x]
+- z_restsK32[i,t,x]
+- z_restsK64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. Build descriptors:
+   z_{i,t}(x) = (1/P) * sum_{p=1}^{P} A_{i,t}(x)_p
+2. Build descriptors for mean-common and mean-residual.
+3. Build descriptors for each truncated-SVD common and residual.
+4. Split by image:
+   - train: 80%
+   - test: 20%
+5. Train a linear classifier for layer-id.
+6. Train a linear classifier for timestep-id.
+7. Repeat for raw and each common/residual family.
+
+Core formula
+------------
+Linear classifier:
+y_hat = W z + b
+
+Required output artifact names
+------------------------------
+- task5_layerprobe_mean.csv
+- task5_timeprobe_mean.csv
+- task5_layerprobe_tsvd.csv
+- task5_timeprobe_tsvd.csv
+- task5_summary.tex
+
+Exact figure / table to generate
+--------------------------------
+- Table T6: layer-id accuracy
+- Table T7: timestep-id accuracy
+- Figure T11: bar chart comparing raw / common / residual
+
+Split / averaging order
+-----------------------
+- Split by image: 80/20
+- Build descriptors per-image / per-layer / per-time first
+- Train on train images, report on test images
+- Never mix common families in the same report
+
+Fail conditions / sanity checks
+-------------------------------
+- If common performs better than residual on both layer-id and timestep-id -> fail
+- If accuracy is near random for both raw and residual -> fail
+- If accuracy is suspiciously too high -> check leakage
+
+------------------------------------------------------------------------------
+TASK 6. CAUSAL ABLATION
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Test the functional role of full/common/residual after Task 5.
+This is the core experiment that moves beyond simple correlation.
+
+Required preparation
+--------------------
+- Task 0 and Task 5 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Use the same descriptor and probe protocol as in Task 5.
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. Build full/common/residual inputs for mean-common.
+2. Build full/common/residual inputs for each K of truncated-SVD common.
+3. Mean-pool across tokens to form descriptors.
+4. Run semantic probe if labels exist.
+5. Run layer-id probe.
+6. Run timestep-id probe.
+7. Compute LDS / CDS / RMSC on the unpooled tensors.
+8. Compare full/common/residual directly within each common family.
+
+Core formula
+------------
+A_full_hat_{i,t} = A_{i,t}
+A_common_hat_{i,t} = A_common
+A_res_hat_{i,t} = B_{i,t}
+
+Required output artifact names
+------------------------------
+- task6_ablation_mean.csv
+- task6_ablation_tsvd.csv
+- task6_ablation_summary.tex
+
+Exact figure / table to generate
+--------------------------------
+- Table T8: full / common / residual comparison for mean-common
+- Table T9: full / common / residual comparison for truncated-SVD common
+- Figure T12: ablation bar chart
+
+Split / averaging order
+-----------------------
+- Split by image: 80/20
+- Use the same train/test split as Task 5
+- Spatial metrics: compute per-image first, average afterwards
+- Never mix mean-common and truncated-SVD common
+
+Fail conditions / sanity checks
+-------------------------------
+- If common is not better than residual on spatial metrics -> fail
+- If residual is not better than common on layer/time probes -> fail
+
+------------------------------------------------------------------------------
+TASK 7. PATCH-WISE COSINE MAPS
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Visualize self-similarity at the patch level.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Fixed subset: exactly 16 fixed images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Layer subset:
+- {1, 14, 28}
+
+Timestep subset:
+- {t_1, t_5, t_10}
+
+Fixed anchor patches:
+- p1 = (floor(H/4), floor(W/4))
+- p2 = (floor(H/2), floor(W/2))
+- p3 = (floor(3H/4), floor(3W/4))
+
+Input tensor names
+------------------
+- A_patch[x]
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. For 16 images, load/run the required layer/timestep combinations.
+2. For each anchor patch, compute the cosine map.
+3. Render separate panels for patch/raw/common/residual.
+4. Report separately for mean-common and truncated-SVD common.
+
+Core formula
+------------
+M_Z(q | p*) = ( Z_{p*}^T Z_q ) / ( ||Z_{p*}||_2 ||Z_q||_2 )
+
+Required output artifact names
+------------------------------
+- task7_patch_cosmap.pdf
+- task7_mean_cosmap.pdf
+- task7_tsvd_cosmap.pdf
+
+Exact figure / table to generate
+--------------------------------
+- Figure T13: patch panel
+- Figure T14: mean-common panel
+- Figure T15: truncated-SVD common panel
+- Figure T16: residual panel
+
+Split / averaging order
+-----------------------
+- No split
+- No averaging if rendering per-image panels
+- Never mix mean-common and truncated-SVD common
+
+Fail conditions / sanity checks
+-------------------------------
+- Cosine at the anchor with itself must be 1 or near 1
+- If the whole map is almost one color -> fail
+
+------------------------------------------------------------------------------
+TASK 8. PCA / T-SNE / UMAP VISUALIZATION
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Visualize the geometry of hidden states.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Use exactly 16 fixed images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+PCA-RGB:
+- use all 28 layers
+- use all 10 timesteps
+- fit a single PCA on all tokens from the 16 images
+
+t-SNE:
+- layer subset: {1,14,28}
+- timestep subset: {t_1,t_5,t_10}
+- reduce to 50 dimensions with PCA before t-SNE
+
+UMAP:
+- token-level: same selection as t-SNE
+- hidden-state-level: use all 28 x 10 hidden states on the 16 images
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+- g[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. PCA-RGB:
+   - fit one global PCA
+   - take the first 3 principal components
+   - reshape back to patch grid
+   - normalize to [0,1]
+   - combine as RGB
+2. t-SNE:
+   - each token is one sample
+   - PCA to 50 dimensions
+   - run t-SNE
+   - color by patch coordinate or semantic region
+3. UMAP:
+   - token-level or hidden-state-level
+   - for hidden-state-level, use descriptor:
+     g_{i,t}(x) = [
+       LDS(A_{i,t}),
+       CDS(A_{i,t}),
+       RMSC(A_{i,t}),
+       Cos_tokenmean(A_{i,t}, A_common(x)),
+       mean(A_{i,t}),
+       var(A_{i,t})
+     ]
+4. Report separately for mean-common and each K.
+
+Core formulas
+-------------
+- PCA-RGB uses the first 3 principal components only
+- t-SNE and UMAP must use exactly the inputs selected above
+
+Required output artifact names
+------------------------------
+- task8_mean_pca_rgb.pdf
+- task8_mean_tsne.pdf
+- task8_mean_umap_token.pdf
+- task8_mean_umap_hiddenstate.pdf
+- task8_tsvd_visuals.pdf
+
+Exact figure / table to generate
+--------------------------------
+- Figure T17: PCA-RGB grid
+- Figure T18: t-SNE token-level
+- Figure T19: UMAP token-level
+- Figure T20: UMAP hidden-state-level
+
+Split / averaging order
+-----------------------
+- No split
+- PCA fit on all selected tokens from the 16 images
+- t-SNE / UMAP fit only on the selected token/descriptors
+- Never mix mean-common and truncated-SVD common
+
+Fail conditions / sanity checks
+-------------------------------
+- If PCA-RGB changes completely across identical reruns -> fail
+- If t-SNE / UMAP collapses everything into one cluster -> fail
+
+------------------------------------------------------------------------------
+TASK 9. SPATIAL STRESS TEST
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Test whether the common representation truly depends on spatial layout.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Control dataset: exactly 100 images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Use exactly two layout-breaking controls:
+1. patch shuffle
+2. block shuffle with 4 x 4 grid
+
+Input tensor names
+------------------
+- A_raw[i,t,x]
+- A_patchshuffle[i,t,x]
+- A_blockshuffle[i,t,x]
+- corresponding common/residual tensors for mean-common and truncated-SVD common
+
+Steps to execute in order
+-------------------------
+1. Generate patch-shuffled and block-shuffled inputs.
+2. Run extraction for all three versions:
+   - original
+   - patch shuffle
+   - block shuffle
+3. Build common/residual for each version.
+4. Compute spatial metrics.
+5. Compute metric drops.
+6. Report separately for mean-common and each K.
+
+Core formulas
+-------------
+Delta_common = phi_spatial(A_common) - phi_spatial(A_common_broken)
+
+Delta_res = phi_spatial(B_{i,t}) - phi_spatial(B_{i,t}^broken)
+
+Required output artifact names
+------------------------------
+- task9_mean_patchshuffle.csv
+- task9_mean_blockshuffle.csv
+- task9_tsvd_stress.csv
+- task9_delta.csv
+
+Exact figure / table to generate
+--------------------------------
+- Table T10: stress test summary
+- Figure T21: input comparison panel
+- Figure T22: metric drop plot
+
+Split / averaging order
+-----------------------
+- No split
+- Compute metric per-image first
+- Compute Delta per-image
+- Average across the 100 control images
+- Never mix mean-common and truncated-SVD common
+
+Fail conditions / sanity checks
+-------------------------------
+- If shuffle does not reduce spatial metrics -> fail
+- If patch shuffle and block shuffle behave identically on everything -> inspect the augmentation
+
+------------------------------------------------------------------------------
+TASK 10 / TASK 11 IN SOURCE. WAVELET DECOMPOSITION
+------------------------------------------------------------------------------
+
+Purpose
+-------
+Analyze common and residual under a multiscale / frequency-like view using wavelets.
+
+Required preparation
+--------------------
+- Task 0 must be completed first
+- Backbone: SiT-XL/2
+- Checkpoint: c*
+- Seed: s0
+- Dataset: 500 images
+
+Exact setting that must be used
+-------------------------------
+This task must be run for:
+- mean-common
+- truncated-SVD common K = 16, 32, 64
+
+Wavelet setting:
+- wavelet family: Haar
+- number of decomposition levels: exactly 2
+- apply to:
+  - A_common^{(t)}
+  - B_{i,t}
+- do not apply to A_patch in the main result
+
+Input tensor names
+------------------
+- A_common_mean[t,x]
+- B_res_mean[i,t,x]
+- A_common_tsvd_K16[i,t,x]
+- A_common_tsvd_K32[i,t,x]
+- A_common_tsvd_K64[i,t,x]
+- B_res_tsvd_K16[i,t,x]
+- B_res_tsvd_K32[i,t,x]
+- B_res_tsvd_K64[i,t,x]
+
+Steps to execute in order
+-------------------------
+1. Reshape each tensor to:
+   H_p x W_p x 1152
+2. For each channel d, run 2D DWT at levels l = 1, 2.
+3. Compute approximation energy.
+4. Compute detail energy.
+5. Compute the ratio:
+   R_wave^{(l)}(Z) = E_A^{(l)}(Z) / E_detail^{(l)}(Z)
+6. Report separately for mean-common and each K.
+
+Core formulas
+-------------
+( A_d^{(l)}, H_d^{(l)}, V_d^{(l)}, D_d^{(l)} ) = DWT2^{(l)}( Z[:,:,d] )
+
+E_A^{(l)}(Z) = sum_{d=1}^{1152} ||A_d^{(l)}||_F^2
+
+E_H^{(l)}(Z) = sum_d ||H_d^{(l)}||_F^2
+E_V^{(l)}(Z) = sum_d ||V_d^{(l)}||_F^2
+E_D^{(l)}(Z) = sum_d ||D_d^{(l)}||_F^2
+
+E_detail^{(l)}(Z) = E_H^{(l)}(Z) + E_V^{(l)}(Z) + E_D^{(l)}(Z)
+
+R_wave^{(l)}(Z) = E_A^{(l)}(Z) / E_detail^{(l)}(Z)
+
+Required output artifact names
+------------------------------
+- task11_wavelet_mean.csv
+- task11_wavelet_tsvd.csv
+- task11_wavelet_ratio.csv
+- task11_figures.pdf
+
+Exact figure / table to generate
+--------------------------------
+- Table T12: wavelet energy summary
+- Figure T24: approximation vs detail energy
+- Figure T25: layer-wise residual wavelet profile
+
+Split / averaging order
+-----------------------
+- No split
+- Compute wavelet energy per-image / per-layer / per-time first
+- For common: average across images, then across timesteps
+- For residual: average across images, then across timesteps, or keep layerwise if required by the figure
+- Never mix mean-common and truncated-SVD common
+
+Fail conditions / sanity checks
+-------------------------------
+- If energy is negative or NaN -> fail
+- If common and residual produce identical wavelet profiles -> fail
+- If reshape is wrong and yields abnormal shape -> fail
+
+================================================================================
+5. WHAT EACH EXPERIMENT IS SUPPOSED TO PROVE
+================================================================================
+
+Exp. 1 / Task 6: Causal ablation
+--------------------------------
+Why:
+- test the functional role of full/common/residual, not only correlation
+
+Metric:
+- probe on A_{i,t}, A_common, B_{i,t}
+- spatial metrics
+
+Expected pattern:
+- common-only should preserve spatial information better
+- residual-only should preserve layer/timestep information better
+
+Exp. 2 / Common-definition robustness
+-------------------------------------
+Why:
+- verify whether the conclusion is robust across different definitions of common
+
+Metric:
+- compare mean-common vs truncated-SVD common
+
+Expected pattern:
+- if the same story appears under both definitions, the conclusion is stronger
+
+Exp. 3 / Task 9: Spatial stress test
+------------------------------------
+Why:
+- test whether common truly depends on spatial layout
+
+Metric:
+- patch shuffle / block shuffle + all main spatial metrics
+
+Expected pattern:
+- A_common should degrade more strongly than residual when spatial layout is destroyed
+
+Exp. 6 / Task 4: Spatial metrics
+--------------------------------
+Why:
+- quantify spatial structure directly
+
+Metric:
+- LDS, CDS, SRSS, RMSC
+
+Expected pattern:
+- A_common should have stronger or more stable spatial structure
+- B_{i,t} should be weaker in spatiality but stronger in source specificity
+
+Exp. 7 / Task 3: Layer-timestep map
+-----------------------------------
+Why:
+- localize where information lives in layer-timestep space
+
+Metric:
+- M_{i,t} = phi(A_{i,t})
+
+Expected pattern:
+- some regions of the layer-timestep map should show strong spatial signal
+- residual should differentiate more strongly over the map
+
+Exp. 10 / Task 11: Wavelet decomposition
+----------------------------------------
+Why:
+- analyze common vs residual under spatial frequency / multiscale structure
+
+Metric:
+- low/detail energy and their ratio
+
+Expected pattern:
+- A_common should have more stable approximation / coarse-scale energy
+- residual should carry more detail or high-frequency-specific structure
+
+================================================================================
+6. PRACTICAL PHASED EXECUTION PLAN
+================================================================================
+
+Phase 1: Pilot
+--------------
+Setting:
+- 100 images
+- 10 timesteps
+- all layers
+- 1 checkpoint
+- 1 seed
+
+Goals:
+- verify hooks
+- verify tensor shapes
+- verify that heatmaps show signal
+- verify that patch-cosine maps are visually interpretable
+
+Phase 2: Main run
+-----------------
+Setting:
+- 500 to 1000 images, recommended 500
+- 10 timesteps
+- all layers
+- 1 main checkpoint
+- 1 seed
+
+Goals:
+- collect all main metrics
+- compare common vs residual in the main report
+
+================================================================================
+7. FINAL CHECKLIST BEFORE CLAIMING RESULTS
+================================================================================
+
+Before making any scientific claim, verify all of the following:
+
+[ ] Task 0 passed all shape / completeness checks
+[ ] Mean-common and truncated-SVD common are both available
+[ ] Residual tensors are not degenerate
+[ ] Basic statistics differ meaningfully across raw/common/residual
+[ ] Similarity heatmaps are symmetric and nontrivial
+[ ] Layer-timestep maps are not flat
+[ ] Spatial metrics are finite and informative
+[ ] Probe results do not show obvious leakage
+[ ] Causal ablation supports the hypothesis:
+    - common better on spatial metrics
+    - residual better on layer/time probes
+[ ] Spatial stress test reduces spatial metrics
+[ ] Wavelet profiles of common and residual are not identical
+[ ] All figures/tables/artifacts have been generated
+
+================================================================================
+8. SHORT INTERPRETATION GUIDE
+================================================================================
+
+If the hypothesis is correct, the final picture should be:
+
+1. Common is closer to raw than residual in similarity structure.
+2. Common carries stronger / more stable spatial information.
+3. Residual carries more layer-id / timestep-id information.
+4. When spatial layout is broken, common degrades more strongly.
+5. In wavelet space, common should lean more toward coarse approximation energy, while residual should preserve more detail-specific structure.
+6. These conclusions should hold not only for mean-common, but also for truncated-SVD common with K = 16, 32, 64.
+
+END OF FILE
