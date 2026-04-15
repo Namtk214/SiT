@@ -3,11 +3,13 @@ Experimental Protocol for Analyzing Common and Residual Representations in SiT
 Version: consolidated from the uploaded protocol, with full Task-by-Task instructions preserved and rewritten for implementation clarity
 ================================================================================
 BASIC INFORMATION:
-- for dataset image: You should extract on ImageNet on bucket mounted in this server
-- This server is TPUv4-16, at first you should try to run on all workers or connect workers with each 
-other, make sure all worker run simultanously (If its warning TPU .... that mean y did not connect all TPU)
+- for dataset image: You should extract on mini Imagenet downloaded in Kaggle from kaggle.json
 - Use pre trained SiT (How to download model: SiT.py)
 - You should create 10 folder for each experiments result
+- Server hiện tại là worker 0 (172.16.0.3). Worker 1 là 172.16.0.2, cần verify SSH sang worker 1 và chuẩn bị multi-host setup
+- Thế này là lỗi: UserWarning: TPU backend initialization is taking more than 60.0 seconds. Did you run your code on all TPU hosts? See https://docs.jax.dev/en/latest/multi_process.html for more information.
+  warnings.warn(...)
+
 
 
 ================================================================================

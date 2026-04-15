@@ -1,8 +1,8 @@
-!git clone https://github.com/willisma/SiT.git
+# !git clone https://github.com/willisma/SiT.git
 import SiT, os
 os.chdir('SiT')
 os.environ['PYTHONPATH'] = '/env/python:/content/SiT'
-!pip install diffusers timm torchdiffeq --upgrade
+# !pip install diffusers timm torchdiffeq --upgrade
 # SiT imports:
 import torch
 from torchvision.utils import save_image
